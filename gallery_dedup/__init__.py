@@ -1,63 +1,153 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-DUP_SCORE_THRESHOLD = 50
+DUP_SCORE_THRESHOLD = 50  # informational only; clustering ignores this score
 DUP_SCORE_ARTIST_SAME = 30
 DUP_SCORE_ARTIST_ONE_EMPTY = 20
 DUP_SCORE_CORE_EXACT = 35
 DUP_CORE_MIN_EFFECTIVE_LEN = 6
 
 _VERSION_TAG = re.compile(r"\[([^\]]*)\]")
-_BRACKETED = re.compile(r"[\[\]()【】（）]")
-_GROUP_LEAD = re.compile(r"^\s*(?:\[([^\]]*)\]|\(([^)]*)\))\s*")
+_BRACKETED = re.compile(r"[\[\]()【】（）［］]")
+_GROUP_LEAD = re.compile(
+    r"^\s*(?:\[([^\]]*)\]|\(([^)]*)\)|【([^】]*)】|（([^）]*)）)\s*"
+)
 
 _LEADING_EVENT_RE = re.compile(r"^\s*[\(（][^\)）]+[\)）]\s*")
-_NOISE_BRACKETS_RE = re.compile(
-    r"[\(\[\{（【［][^\)\]\}）】］]*(?:"
-    r"动态压缩版|动态版|无修|無修正|AI\s*Generated|DL\s*版"
-    r")[^\)\]\}）】］]*[\)\]\}）】］]",
-    re.IGNORECASE,
+_BRACKET_SEGMENT_RE = re.compile(r"[\(\[\{（【［][^\)\]\}）】］]*[\)\]\}）】］]")
+_HANGUL_RANGES = (
+    (0xAC00, 0xD7A3),
+    (0x1100, 0x11FF),
+    (0x3130, 0x318F),
+)
+
+#: Bracket contents treated as version/translation noise rather than artists.
+#: Compared after :func:`fold_title_text` with whitespace/separators removed.
+NOISE_BRACKET_TOKENS: frozenset[str] = frozenset(
+    {
+        "dl版",
+        "無修正",
+        "無修",
+        "无修正",
+        "无修",
+        "动态压缩版",
+        "动态版",
+        "aigenerated",
+        "ai生成",
+        "中国翻訳",
+        "中国翻译",
+        "中文翻译",
+        "漢化",
+        "汉化",
+        "english",
+        "chinese",
+        "japanese",
+        "sample",
+        "サンプル",
+        "見本",
+    }
 )
 
 
-def _core_effective_length(core: str) -> int:
-    """Calculate effective length where CJK characters count as 2 and ASCII counts as 1."""
-    return sum(
-        2 if ("\u3040" <= ch <= "\u30ff" or "\u3400" <= ch <= "\u9fff") else 1
-        for ch in core
+def _normalize_bracket_text(text: str) -> str:
+    return re.sub(r"[\s_\-・.]+", "", fold_title_text(text))
+
+
+def is_noise_bracket(text: str) -> bool:
+    """Return True when *text* is a version/translation noise token.
+
+    Surrounding brackets are tolerated. Matching uses the NFKC-folded text with
+    whitespace and separators removed, so ``DL版``/``［ＤＬ版］``/``【DL版】``
+    all match.
+    """
+    value = (text or "").strip()
+    while len(value) >= 2 and value[0] in "[(【［{" and value[-1] in "])】］}":
+        value = value[1:-1].strip()
+    normalized = _normalize_bracket_text(value)
+    if not normalized:
+        return False
+    return any(
+        normalized == token or normalized.startswith(token)
+        for token in NOISE_BRACKET_TOKENS
     )
 
 
-def normalize_title(title: str) -> str:
-    """Lowercase, drop everything non-alphanumeric (CJK kept), strip spaces.
+def fold_title_text(text: str) -> str:
+    """NFKC-fold and casefold *text*.
 
-    Version markers like ``[DL版]``/``[無修正]`` live inside brackets that are
-    removed, so different versions of the same work collapse onto one key.
+    Full-width alphanumerics become ASCII and full-width brackets become ASCII
+    brackets, so differently encoded titles share one normalized core. Hangul
+    is preserved by :func:`normalize_title`.
     """
-    value = _VERSION_TAG.sub(" ", title or "")
+    return unicodedata.normalize("NFKC", text or "").casefold()
+
+
+def _is_wide_char(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0x3040 <= code <= 0x30FF
+        or 0x3400 <= code <= 0x9FFF
+        or any(low <= code <= high for low, high in _HANGUL_RANGES)
+    )
+
+
+def _core_effective_length(core: str) -> int:
+    """Effective length: CJK/Hangul characters count 2, everything else counts 1."""
+    return sum(2 if _is_wide_char(ch) else 1 for ch in core)
+
+
+def _strip_noise_brackets(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        segment = match.group(0)
+        return " " if is_noise_bracket(segment[1:-1]) else segment
+
+    return _BRACKET_SEGMENT_RE.sub(replace, text)
+
+
+def normalize_title(title: str) -> str:
+    """NFKC-fold, lowercase, drop everything non-alphanumeric (CJK/Hangul kept).
+
+    Noise markers like ``[DL版]``/``【無修正】``/``[中国翻訳]`` are removed
+    together with their brackets, so different versions of the same work
+    collapse onto one key.
+    """
+    value = fold_title_text(title)
+    value = _strip_noise_brackets(value)
+    value = _VERSION_TAG.sub(" ", value)
     value = _BRACKETED.sub(" ", value)
-    return re.sub(r"[^0-9a-z\u3040-\u30ff\u3400-\u9fff]+", "", value.lower())
+    return re.sub(
+        r"[^0-9a-z\u3040-\u30ff\u3400-\u9fff\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3]+",
+        "",
+        value,
+    )
 
 
 def artist_from_title(title: str) -> str | None:
     """Best-effort artist extraction from an ExHentai-style title.
 
-    Handles ``[Circle (Artist)]``, ``[Artist]`` and ``(Artist)`` leading forms.
+    Handles ``[Circle (Artist)]``, ``[Artist]``, ``(Artist)`` and their CJK
+    bracket forms ``【Circle (Artist)】``/``（Artist）``. Noise brackets and
+    ``C\\d+`` event prefixes are skipped rather than treated as artists.
     """
-    lead = _GROUP_LEAD.match(title or "")
-    if not lead:
-        return None
-    inner = (lead.group(1) or lead.group(2) or "").strip()
-    if not inner:
-        return None
-    paren = re.search(r"\(([^)]+)\)", inner)
-    return (paren.group(1) if paren else inner).strip().lower() or None
+    cleaned = (title or "").strip()
+    while True:
+        lead = _GROUP_LEAD.match(cleaned)
+        if not lead:
+            return None
+        inner = next((g for g in lead.groups() if g is not None), "").strip()
+        cleaned = cleaned[lead.end() :].strip()
+        if not inner or is_noise_bracket(inner) or re.fullmatch(r"[cC]\d+", inner):
+            continue
+        paren = re.search(r"\(([^)]+)\)", inner)
+        return (paren.group(1) if paren else inner).strip().lower() or None
+
 
 
 def extract_duplicate_artist_and_core(
@@ -67,10 +157,10 @@ def extract_duplicate_artist_and_core(
 
     1. DUP-STRIP-GIDPREFIX: If gid is provided and raw starts with {gid}- or {gid}_, strip it.
     2. Repeatedly strip leading ()/（） event prefixes.
-    3. Extract artist: inner of [Circle (Artist)] / [Artist]; else Artist - Title.
-       Skip if inner matches C\\d+.
-    4. Strip noise brackets whole-segment (动态压缩版/动态版/无修/無修正/AI Generated/DL版).
-       Do NOT strip volume numbers or subtitles.
+    3. Strip version/translation noise brackets (动态压缩版/动态版/无修/無修正/
+       AI Generated/DL版/中国翻訳/English/...), so they never become artists.
+    4. Extract artist: inner of [Circle (Artist)] / [Artist] / 【Circle (Artist)】;
+       else guarded ``Artist - Title`` split. Skip if inner matches C\\d+.
     5. DUP-PAREN-ALT: extract alt_cores from any (...) / （...） in remainder (effective len >= 6).
     6. Return (artist, primary_core, alt_cores).
     """
@@ -93,14 +183,16 @@ def extract_duplicate_artist_and_core(
             break
         cleaned = rem
 
+    cleaned = _strip_noise_brackets(cleaned).strip()
+
     artist = ""
     while True:
-        m = re.match(r"^\s*\[([^\]]+)\]\s*", cleaned)
+        m = re.match(r"^\s*(?:\[([^\]]+)\]|【([^】]+)】)\s*", cleaned)
         if not m:
             break
-        inner = m.group(1).strip()
+        inner = (m.group(1) or m.group(2) or "").strip()
         cleaned = cleaned[m.end() :].strip()
-        if re.fullmatch(r"[cC]\d+", inner):
+        if re.fullmatch(r"[cC]\d+", inner) or is_noise_bracket(inner):
             continue
         sub = re.search(r"\(([^)]+)\)", inner)
         cand = sub.group(1).strip() if sub else inner
@@ -111,10 +203,18 @@ def extract_duplicate_artist_and_core(
     if not artist:
         m_dash = re.match(r"^\s*([^-–—]+?)\s*[-–—]\s*(.+)$", cleaned)
         if m_dash:
-            artist = m_dash.group(1).strip().lower()
-            cleaned = m_dash.group(2).strip()
+            left = m_dash.group(1).strip()
+            right = m_dash.group(2).strip()
+            left_is_short = " " not in left and "\u3000" not in left
+            right_is_long = (
+                _core_effective_length(normalize_title(right))
+                >= DUP_CORE_MIN_EFFECTIVE_LEN
+            )
+            if left and right and (left_is_short or len(left) <= 24) and right_is_long:
+                artist = left.lower()
+                cleaned = right
 
-    cleaned = _NOISE_BRACKETS_RE.sub(" ", cleaned).strip()
+    cleaned = _strip_noise_brackets(cleaned).strip()
 
     alt_cores: list[str] = []
     for m in re.finditer(r"[\(（]([^\)）]+)[\)）]", cleaned):
@@ -135,7 +235,14 @@ def calculate_duplicate_score(
     a: dict[str, Any],
     b: dict[str, Any],
 ) -> tuple[int, bool]:
-    """Calculate duplicate score and whether an edge can be formed.
+    """Calculate an informational duplicate score and whether an edge could form.
+
+    .. note::
+        This helper is **informational only**. Duplicate clustering uses the
+        bucket rules in :func:`find_duplicate_groups` /
+        :func:`find_gallery_duplicate_groups` and never calls this function or
+        compares against :data:`DUP_SCORE_THRESHOLD`. It is kept for backwards
+        compatibility of the public API.
 
     Returns (score, can_edge).
     """
@@ -227,17 +334,26 @@ class _CandidateItem:
         self.legacy_keys = legacy_keys
 
 
+def _group_key(group: dict[str, Any]) -> str:
+    return f"{group['mode_artist']}|{group['core']}"
+
+
+def _group_rank(group: dict[str, Any]) -> tuple[int, int]:
+    return (1 if group["mode_artist"] else 0, len(group["core"]))
+
+
 def _cluster_duplicate_candidates(candidates: list[_CandidateItem]) -> list[dict[str, Any]]:
     buckets: dict[str, list[tuple[_CandidateItem, bool]]] = defaultdict(list)
     for cand in candidates:
-        for pri in cand.primary_cores:
+        for pri in sorted(cand.primary_cores):
             buckets[pri].append((cand, True))
-        for alt in cand.alt_cores:
+        for alt in sorted(cand.alt_cores):
             buckets[alt].append((cand, False))
 
     raw_groups: list[dict[str, Any]] = []
 
-    for core, bucket_items in buckets.items():
+    for core in sorted(buckets):
+        bucket_items = buckets[core]
         if not any(is_pri for _, is_pri in bucket_items):
             continue
 
@@ -301,25 +417,70 @@ def _cluster_duplicate_candidates(candidates: list[_CandidateItem]) -> list[dict
                     }
                 )
 
-    final_groups_map: dict[frozenset[int], dict[str, Any]] = {}
-    for rg in raw_groups:
-        gid_set = frozenset(c.gid for c in rg["candidates"])
-        existing = final_groups_map.get(gid_set)
-        if existing is None:
-            final_groups_map[gid_set] = rg
-        else:
-            score_new = (1 if rg["mode_artist"] else 0, len(rg["core"]))
-            score_old = (1 if existing["mode_artist"] else 0, len(existing["core"]))
-            if score_new > score_old:
-                final_groups_map[gid_set] = rg
+    # Union groups that share at least one gid (same gallery listed under both
+    # its English and Japanese title). Groups with disjoint gids stay separate:
+    # there is deliberately no empty-artist bridging.
+    parent = list(range(len(raw_groups)))
+
+    def find(idx: int) -> int:
+        while parent[idx] != idx:
+            parent[idx] = parent[parent[idx]]
+            idx = parent[idx]
+        return idx
+
+    def union(a: int, b: int) -> None:
+        root_a, root_b = find(a), find(b)
+        if root_a != root_b:
+            parent[max(root_a, root_b)] = min(root_a, root_b)
+
+    gid_owner: dict[int, int] = {}
+    for idx, rg in enumerate(raw_groups):
+        for cand in rg["candidates"]:
+            owner = gid_owner.get(cand.gid)
+            if owner is None:
+                gid_owner[cand.gid] = idx
+            else:
+                union(owner, idx)
+
+    components: dict[int, list[int]] = defaultdict(list)
+    for idx in range(len(raw_groups)):
+        components[find(idx)].append(idx)
 
     result_groups: list[dict[str, Any]] = []
-    for rg in final_groups_map.values():
-        mode_artist = rg["mode_artist"]
-        core = rg["core"]
-        items = [c.item_dict for c in rg["candidates"]]
+    for root in sorted(components):
+        indices = components[root]
+
+        best_idx = indices[0]
+        for idx in indices[1:]:
+            rank, best_rank = _group_rank(raw_groups[idx]), _group_rank(raw_groups[best_idx])
+            if rank > best_rank or (
+                rank == best_rank
+                and _group_key(raw_groups[idx]) < _group_key(raw_groups[best_idx])
+            ):
+                best_idx = idx
+
+        best_group = raw_groups[best_idx]
+        mode_artist = best_group["mode_artist"]
+        core = best_group["core"]
+
+        merged_candidates: list[_CandidateItem] = []
+        seen_merged: set[int] = set()
+        for idx in indices:
+            for cand in raw_groups[idx]["candidates"]:
+                if cand.gid not in seen_merged:
+                    seen_merged.add(cand.gid)
+                    merged_candidates.append(cand)
+
+        items = [c.item_dict for c in merged_candidates]
         items.sort(key=lambda e: (e.get("title") or "", e.get("gid", 0)))
-        legacy_keys = sorted({k for c in rg["candidates"] for k in c.legacy_keys})
+        legacy_keys = sorted(
+            {
+                key
+                for idx in indices
+                for cand in raw_groups[idx]["candidates"]
+                for key in cand.legacy_keys
+            }
+        )
         result_groups.append(
             {
                 "key": f"{mode_artist}|{core}",
@@ -329,7 +490,13 @@ def _cluster_duplicate_candidates(candidates: list[_CandidateItem]) -> list[dict
             }
         )
 
-    result_groups.sort(key=lambda g: (-len(g["items"]), (g["items"][0].get("title") or "")))
+    result_groups.sort(
+        key=lambda g: (
+            -len(g["items"]),
+            (g["items"][0].get("title") or ""),
+            g["key"],
+        )
+    )
     return result_groups
 
 
@@ -556,6 +723,7 @@ __all__ = [
     "DUP_SCORE_ARTIST_SAME",
     "DUP_SCORE_CORE_EXACT",
     "DUP_SCORE_THRESHOLD",
+    "NOISE_BRACKET_TOKENS",
     "_CandidateItem",
     "_cluster_duplicate_candidates",
     "_core_effective_length",
@@ -565,5 +733,7 @@ __all__ = [
     "extract_duplicate_artist_and_core",
     "find_duplicate_groups",
     "find_gallery_duplicate_groups",
+    "fold_title_text",
+    "is_noise_bracket",
     "normalize_title",
 ]

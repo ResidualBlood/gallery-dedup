@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gallery-dedup"
-version = "0.1.0"
+version = "0.2.0"
 description = "Pure Python algorithms for gallery title normalization, artist extraction, and duplicate clustering."
 readme = "README.md"
 requires-python = ">=3.10"
